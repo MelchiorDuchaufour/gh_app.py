@@ -5,6 +5,8 @@ from influxdb_client import InfluxDBClient
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+import os
+from pathlib import Path
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
 # Optional EPW support (nice to have)
@@ -13,7 +15,30 @@ try:
     PVLIB_OK = True
 except Exception:
     PVLIB_OK = False
+def get_influx_settings():
+    # Priority: session_state -> secrets -> env
+    return {
+        "url": st.session_state.get("INFLUX_URL") or st.secrets.get("INFLUX_URL", os.getenv("INFLUX_URL", "http://127.0.0.1:8086")),
+        "org": st.session_state.get("INFLUX_ORG") or st.secrets.get("INFLUX_ORG", os.getenv("INFLUX_ORG", "phd")),
+        "bucket": st.session_state.get("INFLUX_BUCKET") or st.secrets.get("INFLUX_BUCKET", os.getenv("INFLUX_BUCKET", "greenhouse")),
+        "token": st.session_state.get("INFLUX_TOKEN") or st.secrets.get("INFLUX_TOKEN", os.getenv("INFLUX_TOKEN", "")),
+    }
 
+def influx_client():
+    cfg = get_influx_settings()
+    if not cfg["token"]:
+        raise RuntimeError("Influx token missing. Enter it in the Connection panel.")
+    return InfluxDBClient(url=cfg["url"], token=cfg["token"], org=cfg["org"])
+
+def save_local_secrets(url, org, bucket, token):
+    # Only meaningful locally. On Streamlit Cloud, secrets are managed in UI.
+    secrets_dir = Path(".streamlit")
+    secrets_dir.mkdir(exist_ok=True)
+    secrets_file = secrets_dir / "secrets.toml"
+    secrets_file.write_text(
+        f'INFLUX_URL="{url}"\nINFLUX_ORG="{org}"\nINFLUX_BUCKET="{bucket}"\nINFLUX_TOKEN="{token}"\n',
+        encoding="utf-8"
+    )
 
 # -----------------------------
 # Models (what your simulator will consume)
@@ -144,53 +169,26 @@ def influx_client():
         raise RuntimeError("Missing INFLUX_URL / INFLUX_TOKEN / INFLUX_ORG in secrets or env vars.")
     return InfluxDBClient(url=url, token=token, org=org)
 
-def query_zone_forcing(bucket: str, zone: str, hours: int = 24) -> pd.DataFrame:
-    """
-    Returns a dataframe indexed by time with columns:
-    temperature_air, humidity_air, temperature_soil, moisture_soil (if present)
-    """
+def query_soil(bucket: str, hours: int = 24) -> pd.DataFrame:
     flux = f'''
 from(bucket: "{bucket}")
   |> range(start: -{hours}h)
-  |> filter(fn: (r) => r._measurement == "greenhouse")
-  |> filter(fn: (r) => r.zone == "{zone}")
-  |> filter(fn: (r) => r._field == "temperature" or r._field == "humidity" or r._field == "moisture")
-  |> aggregateWindow(every: 1m, fn: mean, createEmpty: false)
+  |> filter(fn: (r) => r._measurement == "soil")
+  |> filter(fn: (r) => r._field == "moisture" or r._field == "temperature")
   |> pivot(rowKey:["_time"], columnKey: ["_field"], valueColumn: "_value")
-  |> keep(columns: ["_time","temperature","humidity","moisture","sensor"])
+  |> keep(columns: ["_time","moisture","temperature"])
   |> sort(columns: ["_time"])
 '''
     with influx_client() as client:
         q = client.query_api().query_data_frame(flux)
-        if isinstance(q, list):
-            df = pd.concat(q, ignore_index=True)
-        else:
-            df = q
+        df = pd.concat(q, ignore_index=True) if isinstance(q, list) else q
 
-    if df.empty:
-        return df
-
-    # Some pivots can produce extra cols; normalize
-    if "_time" not in df.columns:
+    if df.empty or "_time" not in df.columns:
         return pd.DataFrame()
 
     df["_time"] = pd.to_datetime(df["_time"])
-    df = df.sort_values("_time")
-
-    # If you have a "sensor" tag (air/soil) you can split fields properly.
-    # If not, you can still use temperature/humidity/moisture directly.
-    df = df.set_index("_time")
-
-    # Rename to model-friendly names
-    out = pd.DataFrame(index=df.index)
-    if "temperature" in df.columns:
-        out["temperature"] = df["temperature"]
-    if "humidity" in df.columns:
-        out["humidity"] = df["humidity"]
-    if "moisture" in df.columns:
-        out["moisture"] = df["moisture"]
-
-    return out
+    df = df.set_index("_time").sort_index()
+    return df
 
 
 def parse_weather(uploaded_file):
@@ -217,7 +215,7 @@ st.caption("Build a greenhouse setup + plant zones + weather input, export as JS
 if "zones" not in st.session_state:
     st.session_state["zones"] = []
 
-1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["Greenhouse", "Systems", "Plant zones", "Weather", "Export", "Data (InfluxDB)"])
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["Greenhouse", "Systems", "Plant zones", "Weather", "Export", "Data (InfluxDB)"])
 
 with tab1:
     st.subheader("Greenhouse geometry")
@@ -319,7 +317,7 @@ with tab4:
     st.markdown("**Tip for CSV columns** (you can map these later in your simulator):")
     st.code("datetime, temp_air_C, rh_pct, wind_mps, ghi_Wm2, dni_Wm2, dhi_Wm2, pressure_Pa (optional), co2_ppm (optional)")
 
-with 5:
+with tab5:
     st.subheader("Export config")
     try:
         zones_models = [PlantZone(**z) for z in st.session_state["zones"]]
@@ -344,27 +342,53 @@ with 5:
 with tab6:
     st.subheader("Use real sensor data (InfluxDB) as forcing")
 
-    bucket = st.secrets.get("INFLUX_BUCKET", os.getenv("INFLUX_BUCKET", "greenhouse"))
+    st.markdown("### Connection")
+    cfg = get_influx_settings()
+
+    c1, c2 = st.columns(2)
+    with c1:
+        url = st.text_input("Influx URL", value=cfg["url"])
+        org = st.text_input("Org", value=cfg["org"])
+        bucket = st.text_input("Bucket", value=cfg["bucket"])
+    with c2:
+        token = st.text_input("Token", value=cfg["token"], type="password")
+        remember = st.checkbox("Save locally (only this computer)", value=False)
+
+    if st.button("Connect"):
+        st.session_state["INFLUX_URL"] = url
+        st.session_state["INFLUX_ORG"] = org
+        st.session_state["INFLUX_BUCKET"] = bucket
+        st.session_state["INFLUX_TOKEN"] = token
+
+        try:
+            with influx_client() as client:
+                health = client.health()
+            st.success(f"Connected. Status: {health.status}")
+            if remember:
+                save_local_secrets(url, org, bucket, token)
+                st.info("Saved to .streamlit/secrets.toml (local only).")
+        except Exception as e:
+            st.error(f"Connection failed: {e}")
+            st.stop()
+
+    st.markdown("### Load data")
     hours = st.slider("Lookback (hours)", 1, 168, 24)
 
-    # Use your zone names from the config builder
-    zone_names = [z["name"] for z in st.session_state.get("zones", [])] or ["Zone 1"]
-    zone = st.selectbox("Zone", zone_names)
-
-    if st.button("Load data from InfluxDB"):
+    if st.button("Load SOIL data"):
         try:
-            df_forcing = query_zone_forcing(bucket=bucket, zone=zone, hours=hours)
-            if df_forcing.empty:
-                st.warning("No data returned. Check measurement/tags in InfluxDB.")
+            df = query_soil(bucket=get_influx_settings()["bucket"], hours=hours)
+            if df.empty:
+                st.warning("No data returned. Check measurement name ('soil') and time range.")
             else:
-                st.success(f"Loaded {len(df_forcing)} rows")
-                st.dataframe(df_forcing.tail(50), use_container_width=True)
-                st.line_chart(df_forcing[["temperature","humidity"]] if "humidity" in df_forcing.columns else df_forcing)
-                st.session_state["forcing_df"] = df_forcing  # store for model use
+                st.success(f"Loaded {len(df)} rows")
+                st.dataframe(df.tail(50), use_container_width=True)
+                st.line_chart(df[["moisture", "temperature"]])
+                st.session_state["forcing_df"] = df
         except Exception as e:
             st.error(str(e))
 
     if "forcing_df" in st.session_state:
         st.markdown("### Ready for modelling")
         st.write("Forcing dataframe is stored in `st.session_state['forcing_df']`.")
+
 
