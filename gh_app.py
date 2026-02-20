@@ -1,7 +1,7 @@
 import json
 from enum import Enum
 from typing import List, Optional
-
+from influxdb_client import InfluxDBClient
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
@@ -136,6 +136,61 @@ def draw_floorplan(width_m: float, length_m: float, zones: List[PlantZone]):
         margin=dict(l=40, r=40, t=60, b=40)
     )
     st.plotly_chart(fig, use_container_width=True)
+def influx_client():
+    url = st.secrets.get("INFLUX_URL", os.getenv("INFLUX_URL"))
+    token = st.secrets.get("INFLUX_TOKEN", os.getenv("INFLUX_TOKEN"))
+    org = st.secrets.get("INFLUX_ORG", os.getenv("INFLUX_ORG"))
+    if not url or not token or not org:
+        raise RuntimeError("Missing INFLUX_URL / INFLUX_TOKEN / INFLUX_ORG in secrets or env vars.")
+    return InfluxDBClient(url=url, token=token, org=org)
+
+def query_zone_forcing(bucket: str, zone: str, hours: int = 24) -> pd.DataFrame:
+    """
+    Returns a dataframe indexed by time with columns:
+    temperature_air, humidity_air, temperature_soil, moisture_soil (if present)
+    """
+    flux = f'''
+from(bucket: "{bucket}")
+  |> range(start: -{hours}h)
+  |> filter(fn: (r) => r._measurement == "greenhouse")
+  |> filter(fn: (r) => r.zone == "{zone}")
+  |> filter(fn: (r) => r._field == "temperature" or r._field == "humidity" or r._field == "moisture")
+  |> aggregateWindow(every: 1m, fn: mean, createEmpty: false)
+  |> pivot(rowKey:["_time"], columnKey: ["_field"], valueColumn: "_value")
+  |> keep(columns: ["_time","temperature","humidity","moisture","sensor"])
+  |> sort(columns: ["_time"])
+'''
+    with influx_client() as client:
+        q = client.query_api().query_data_frame(flux)
+        if isinstance(q, list):
+            df = pd.concat(q, ignore_index=True)
+        else:
+            df = q
+
+    if df.empty:
+        return df
+
+    # Some pivots can produce extra cols; normalize
+    if "_time" not in df.columns:
+        return pd.DataFrame()
+
+    df["_time"] = pd.to_datetime(df["_time"])
+    df = df.sort_values("_time")
+
+    # If you have a "sensor" tag (air/soil) you can split fields properly.
+    # If not, you can still use temperature/humidity/moisture directly.
+    df = df.set_index("_time")
+
+    # Rename to model-friendly names
+    out = pd.DataFrame(index=df.index)
+    if "temperature" in df.columns:
+        out["temperature"] = df["temperature"]
+    if "humidity" in df.columns:
+        out["humidity"] = df["humidity"]
+    if "moisture" in df.columns:
+        out["moisture"] = df["moisture"]
+
+    return out
 
 
 def parse_weather(uploaded_file):
@@ -162,7 +217,7 @@ st.caption("Build a greenhouse setup + plant zones + weather input, export as JS
 if "zones" not in st.session_state:
     st.session_state["zones"] = []
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["Greenhouse", "Systems", "Plant zones", "Weather", "Export"])
+1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["Greenhouse", "Systems", "Plant zones", "Weather", "Export", "Data (InfluxDB)"])
 
 with tab1:
     st.subheader("Greenhouse geometry")
@@ -264,7 +319,7 @@ with tab4:
     st.markdown("**Tip for CSV columns** (you can map these later in your simulator):")
     st.code("datetime, temp_air_C, rh_pct, wind_mps, ghi_Wm2, dni_Wm2, dhi_Wm2, pressure_Pa (optional), co2_ppm (optional)")
 
-with tab5:
+with 5:
     st.subheader("Export config")
     try:
         zones_models = [PlantZone(**z) for z in st.session_state["zones"]]
@@ -286,3 +341,30 @@ with tab5:
     except ValidationError as e:
         st.error("Config invalid. Fix inputs first.")
         st.code(str(e))
+with tab6:
+    st.subheader("Use real sensor data (InfluxDB) as forcing")
+
+    bucket = st.secrets.get("INFLUX_BUCKET", os.getenv("INFLUX_BUCKET", "greenhouse"))
+    hours = st.slider("Lookback (hours)", 1, 168, 24)
+
+    # Use your zone names from the config builder
+    zone_names = [z["name"] for z in st.session_state.get("zones", [])] or ["Zone 1"]
+    zone = st.selectbox("Zone", zone_names)
+
+    if st.button("Load data from InfluxDB"):
+        try:
+            df_forcing = query_zone_forcing(bucket=bucket, zone=zone, hours=hours)
+            if df_forcing.empty:
+                st.warning("No data returned. Check measurement/tags in InfluxDB.")
+            else:
+                st.success(f"Loaded {len(df_forcing)} rows")
+                st.dataframe(df_forcing.tail(50), use_container_width=True)
+                st.line_chart(df_forcing[["temperature","humidity"]] if "humidity" in df_forcing.columns else df_forcing)
+                st.session_state["forcing_df"] = df_forcing  # store for model use
+        except Exception as e:
+            st.error(str(e))
+
+    if "forcing_df" in st.session_state:
+        st.markdown("### Ready for modelling")
+        st.write("Forcing dataframe is stored in `st.session_state['forcing_df']`.")
+
